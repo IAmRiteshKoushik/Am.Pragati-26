@@ -17,23 +17,48 @@ pipeline {
     BUILD_CONTEXT = '.'
     GITLAB_CREDS = credentials('gitlab-pat')
     GITOPS_CREDS = credentials('github-pat')
-    GITOPS_REPO = 'https://github.com/IAmRiteshKoushik/convene-gitops.git'
-    GITOPS_GITLAB = 'https://git.amrita.edu/amrita-2.0/convene-gitops.git'
   }
 
   stages {
-    stage('Resolve tags') {
+    stage('Resolve env') {
       steps {
         script {
+          def branch = env.BRANCH_NAME ?: env.GIT_BRANCH?.replaceAll('^origin/', '') ?: 'main'
+          env.GIT_BRANCH_NAME = branch
+
+          switch (branch) {
+            case 'main':
+              env.DEPLOY_ENV = 'prod'
+              env.DEPLOY_NAMESPACE = 'apps'
+              env.GITOPS_OVERLAY = 'apps/pragati/overlays/prod'
+              env.ARGO_APP = 'pragati'
+              break
+            case 'pre-prod':
+              env.DEPLOY_ENV = 'pre-prod'
+              env.DEPLOY_NAMESPACE = 'pragati-preprod'
+              env.GITOPS_OVERLAY = 'apps/pragati/overlays/pre-prod'
+              env.ARGO_APP = 'pragati-preprod'
+              break
+            case 'dev':
+              env.DEPLOY_ENV = 'dev'
+              env.DEPLOY_NAMESPACE = 'pragati-dev'
+              env.GITOPS_OVERLAY = 'apps/pragati/overlays/dev'
+              env.ARGO_APP = 'pragati-dev'
+              break
+            default:
+              error "Branch '${branch}' is not mapped. Use: dev → pre-prod → main (PROD)."
+          }
+
           env.GIT_SHA = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
-          env.IMAGE_TAG = "${env.BUILD_NUMBER}-${env.GIT_SHA}"
+          env.IMAGE_TAG = "${env.DEPLOY_ENV}-${env.BUILD_NUMBER}-${env.GIT_SHA}"
           def path = env.GITLAB_PROJECT_PATH.toLowerCase()
           env.CR_IMAGE = "${env.REGISTRY_HOST}/${path}/${env.IMAGE_NAME}:${env.IMAGE_TAG}"
-          env.CR_IMAGE_LATEST = "${env.REGISTRY_HOST}/${path}/${env.IMAGE_NAME}:latest"
+          env.CR_IMAGE_LATEST = "${env.REGISTRY_HOST}/${path}/${env.IMAGE_NAME}:${env.DEPLOY_ENV}"
           env.LOCAL_IMAGE = "${env.IMAGE_NAME}:${env.IMAGE_TAG}"
-          env.LOCAL_IMAGE_LATEST = "${env.IMAGE_NAME}:latest"
+          env.LOCAL_IMAGE_ENV = "${env.IMAGE_NAME}:${env.DEPLOY_ENV}"
           env.PACKAGE_VERSION = env.IMAGE_TAG.replaceAll('[^A-Za-z0-9._-]', '-')
-          currentBuild.description = "${env.LOCAL_IMAGE}"
+          currentBuild.description = "${env.DEPLOY_ENV} ${env.LOCAL_IMAGE}"
+          echo "Deploying ${env.LOCAL_IMAGE} → ${env.DEPLOY_ENV} (${env.DEPLOY_NAMESPACE})"
         }
       }
     }
@@ -46,7 +71,7 @@ pipeline {
           docker build \
             -f "${DOCKERFILE_PATH}" \
             -t "${LOCAL_IMAGE}" \
-            -t "${LOCAL_IMAGE_LATEST}" \
+            -t "${LOCAL_IMAGE_ENV}" \
             -t "${CR_IMAGE}" \
             -t "${CR_IMAGE_LATEST}" \
             "${BUILD_CONTEXT}"
@@ -97,58 +122,55 @@ pipeline {
           set -ex
           docker save "${LOCAL_IMAGE}" | docker run --rm -i --privileged --pid=host alpine:3.20 \
             sh -c "apk add --no-cache util-linux >/dev/null && nsenter -t 1 -m -u -i -n -p -- /usr/local/bin/k3s ctr images import -"
+          # Also tag env alias inside k3s via re-import of env-tagged local image
+          docker save "${LOCAL_IMAGE_ENV}" | docker run --rm -i --privileged --pid=host alpine:3.20 \
+            sh -c "apk add --no-cache util-linux >/dev/null && nsenter -t 1 -m -u -i -n -p -- /usr/local/bin/k3s ctr images import -" || true
         '''
       }
     }
 
-    stage('Bump gitops image + deploy') {
+    stage('Bump gitops overlay') {
       steps {
         sh '''
           set -ex
           rm -rf /tmp/convene-gitops
-          # Authenticated clone (github-pat is username/password)
           git clone --depth 1 "https://${GITOPS_CREDS_USR}:${GITOPS_CREDS_PSW}@github.com/IAmRiteshKoushik/convene-gitops.git" /tmp/convene-gitops
           cd /tmp/convene-gitops
 
-          # Pin image in deployment + kustomization
-          sed -i.bak -E "s|image: pragati:.*|image: ${LOCAL_IMAGE}|g" apps/pragati/deployment.yaml
-          sed -i.bak -E "s|newTag: .*|newTag: ${IMAGE_TAG}|g" apps/pragati/kustomization.yaml
-          rm -f apps/pragati/*.bak
-          grep -n "image:\\|newTag:" apps/pragati/deployment.yaml apps/pragati/kustomization.yaml
+          test -f "${GITOPS_OVERLAY}/kustomization.yaml"
+          sed -i.bak -E "s|newTag: .*|newTag: ${IMAGE_TAG}|g" "${GITOPS_OVERLAY}/kustomization.yaml"
+          rm -f "${GITOPS_OVERLAY}/kustomization.yaml.bak"
+          grep -n "newTag:" "${GITOPS_OVERLAY}/kustomization.yaml"
 
           git config user.name "Ashrockzzz2003"
           git config user.email "ashrockzzz2003@users.noreply.github.com"
-          git add apps/pragati/deployment.yaml apps/pragati/kustomization.yaml
+          git add "${GITOPS_OVERLAY}/kustomization.yaml"
           if git diff --cached --quiet; then
             echo "No gitops changes"
           else
-            git commit -m "deploy(pragati): ${LOCAL_IMAGE}"
-            # Push GitHub (code-control / sync source)
+            git commit -m "deploy(pragati/${DEPLOY_ENV}): ${LOCAL_IMAGE}"
             git push "https://${GITOPS_CREDS_USR}:${GITOPS_CREDS_PSW}@github.com/IAmRiteshKoushik/convene-gitops.git" HEAD:main
-            # Push GitLab immediately so Argo does not wait on Actions sync
             git push "https://${GITLAB_CREDS_USR}:${GITLAB_CREDS_PSW}@git.amrita.edu/amrita-2.0/convene-gitops.git" HEAD:main
           fi
         '''
       }
     }
 
-    stage('Wait for Argo / rollout') {
+    stage('Rollout') {
       steps {
         sh '''
           set -ex
-          # Give Argo a moment to pick up the gitops commit
-          for i in $(seq 1 30); do
-            IMG=$(kubectl -n apps get deploy pragati -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)
+          for i in $(seq 1 36); do
+            IMG=$(kubectl -n "${DEPLOY_NAMESPACE}" get deploy pragati -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)
             echo "current image: ${IMG}"
             if [ "${IMG}" = "${LOCAL_IMAGE}" ]; then
               break
             fi
-            # Force sync if argocd CLI unavailable — patch is fine; Argo self-heals to same image
-            kubectl -n apps set image deployment/pragati pragati="${LOCAL_IMAGE}" || true
+            kubectl -n "${DEPLOY_NAMESPACE}" set image deployment/pragati pragati="${LOCAL_IMAGE}" || true
             sleep 5
           done
-          kubectl -n apps rollout status deployment/pragati --timeout=180s
-          kubectl -n apps get pods,svc -l app=pragati -o wide
+          kubectl -n "${DEPLOY_NAMESPACE}" rollout status deployment/pragati --timeout=180s
+          kubectl -n "${DEPLOY_NAMESPACE}" get pods,svc -l app=pragati -o wide
         '''
       }
     }
@@ -156,7 +178,7 @@ pipeline {
 
   post {
     success {
-      echo "Published ${LOCAL_IMAGE} and rolled out via gitops/Argo"
+      echo "Published ${LOCAL_IMAGE} to ${DEPLOY_ENV} (${DEPLOY_NAMESPACE})"
     }
   }
 }
