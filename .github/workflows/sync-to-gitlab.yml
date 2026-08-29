@@ -15,5 +15,4 @@ jobs:
           gitlab_url: ${{ secrets.GITLAB_URL }}
           username: ${{ secrets.GITLAB_USERNAME }}
           gitlab_pat: ${{ secrets.GITLAB_PAT }}
-          # Histories may diverge until GitHub has Dockerfile/CI commits
           force_push: true
