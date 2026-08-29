@@ -1,5 +1,7 @@
 Welcome to your new TanStack app! 
 
+<!-- Testing push to GitLab -->
+
 # Getting Started
 
 To run this application:
