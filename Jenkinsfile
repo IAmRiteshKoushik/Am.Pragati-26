@@ -134,7 +134,8 @@ pipeline {
         sh '''
           set -ex
           rm -rf /tmp/convene-gitops
-          git clone --depth 1 "https://${GITOPS_CREDS_USR}:${GITOPS_CREDS_PSW}@github.com/IAmRiteshKoushik/convene-gitops.git" /tmp/convene-gitops
+          # Prefer campus GitLab (Argo source); avoids GitHub DNS flakes from the node
+          git clone --depth 1 "https://${GITLAB_CREDS_USR}:${GITLAB_CREDS_PSW}@git.amrita.edu/amrita-2.0/convene-gitops.git" /tmp/convene-gitops
           cd /tmp/convene-gitops
 
           test -f "${GITOPS_OVERLAY}/kustomization.yaml"
@@ -149,8 +150,8 @@ pipeline {
             echo "No gitops changes"
           else
             git commit -m "deploy(pragati/${DEPLOY_ENV}): ${LOCAL_IMAGE}"
-            git push "https://${GITOPS_CREDS_USR}:${GITOPS_CREDS_PSW}@github.com/IAmRiteshKoushik/convene-gitops.git" HEAD:main
-            git push "https://${GITLAB_CREDS_USR}:${GITLAB_CREDS_PSW}@git.amrita.edu/amrita-2.0/convene-gitops.git" HEAD:main
+            git push origin HEAD:main
+            git push "https://${GITOPS_CREDS_USR}:${GITOPS_CREDS_PSW}@github.com/IAmRiteshKoushik/convene-gitops.git" HEAD:main || echo "WARN: GitHub gitops mirror failed"
           fi
         '''
       }
