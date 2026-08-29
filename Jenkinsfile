@@ -106,7 +106,8 @@ pipeline {
         sh '''
           set -ex
           rm -rf /tmp/convene-gitops
-          git clone --depth 1 "${GITOPS_REPO}" /tmp/convene-gitops
+          # Authenticated clone (github-pat is username/password)
+          git clone --depth 1 "https://${GITOPS_CREDS_USR}:${GITOPS_CREDS_PSW}@github.com/IAmRiteshKoushik/convene-gitops.git" /tmp/convene-gitops
           cd /tmp/convene-gitops
 
           # Pin image in deployment + kustomization
